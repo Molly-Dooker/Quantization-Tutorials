@@ -243,7 +243,6 @@ class Llama3Model(nn.Module):
         x = tok_embeds
         x = self.trf_blocks(x)
         x = self.final_norm(x)
-        ipdb.set_trace()
         logits = self.out_head(x.to(torch.bfloat16))
         return logits
     
@@ -512,7 +511,7 @@ def load_weights_into_llama(model, param_config, params):
 
     # Load output layer weights
     model.final_norm.weight = assign(model.final_norm.weight, params["model.norm.weight"], "model.norm.weight")
-    ipdb.set_trace()
+
     if "lm_head.weight" in params.keys():
         model.out_head.weight = assign(model.out_head.weight, params["lm_head.weight"], "lm_head.weight")
     else:
@@ -568,14 +567,13 @@ def token_ids_to_text(token_ids, tokenizer):
 def generate(model, idx, max_new_tokens, context_size, temperature=0.0, top_k=None, eos_id=None):
 
     # For-loop is the same as before: Get logits, and only focus on last time step
-    NN = 0
-    for _ in range(max_new_tokens):
 
-        NN+=1
+    for _ in range(max_new_tokens):
         idx_cond = idx[:, -context_size:]
         
         with torch.no_grad():
             logits = model(idx_cond)
+            ipdb.set_trace()
         logits = logits[:, -1, :]
 
         # New: Filter logits with top_k sampling
@@ -600,12 +598,11 @@ def generate(model, idx, max_new_tokens, context_size, temperature=0.0, top_k=No
             idx_next = torch.argmax(logits, dim=-1, keepdim=True)  # (batch_size, 1)
 
         if idx_next == eos_id:  # Stop generating early if end-of-sequence token is encountered and eos_id is specified
-            print(f'NN:{NN}')
+
             break
 
         # Same as before: append sampled index to the running sequence
         idx = torch.cat((idx, idx_next), dim=1)  # (batch_size, num_tokens+1)
-    print(f'NN:{NN}')
     return idx
 
 
@@ -614,6 +611,7 @@ def generate(model, idx, max_new_tokens, context_size, temperature=0.0, top_k=No
 PROMPT = "What do llamas eat?"
 
 torch.manual_seed(123)
+
 token_ids = generate(
     model=model,
     idx=text_to_token_ids(PROMPT, chat_tokenizer).to(device),

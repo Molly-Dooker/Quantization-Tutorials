@@ -12,7 +12,6 @@ model_id = "meta-llama/Llama-3.2-1B-Instruct"
 batch_size, max_seq_length = 1, 1
 
 model = AutoModelForCausalLM.from_pretrained(model_id)
-# ipdb.set_trace()
 tokenizer = AutoTokenizer.from_pretrained(model_id)
 flops, macs, params = calculate_flops(model=model,
                                       input_shape=(batch_size, max_seq_length),
