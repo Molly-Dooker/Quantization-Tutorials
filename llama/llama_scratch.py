@@ -7,9 +7,10 @@ import tiktoken
 from tiktoken.load import load_tiktoken_bpe
 from safetensors.torch import load_file
 from huggingface_hub import hf_hub_download
+from transformers import AutoTokenizer
+torch.manual_seed(123)
 
-
-class FeedForward(nn.Module):
+class MLP(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.fc1 = nn.Linear(cfg["emb_dim"], cfg["hidden_dim"], dtype=cfg["dtype"], bias=False)
@@ -26,10 +27,8 @@ class FeedForward(nn.Module):
 def precompute_rope_params(head_dim, theta_base=10_000, context_length=4096, freq_config=None):
     assert head_dim % 2 == 0, "Embedding dimension must be even"
 
-    # Compute the inverse frequencies
     inv_freq = 1.0 / (theta_base ** (torch.arange(0, head_dim, 2)[: (head_dim // 2)].float() / head_dim))
 
-    # Frequency adjustments
     if freq_config is not None:
         low_freq_wavelen = freq_config["original_context_length"] / freq_config["low_freq_factor"]
         high_freq_wavelen = freq_config["original_context_length"] / freq_config["high_freq_factor"]
@@ -64,7 +63,6 @@ def precompute_rope_params(head_dim, theta_base=10_000, context_length=4096, fre
     # Precompute sine and cosine
     cos = torch.cos(angles)
     sin = torch.sin(angles)
-
     return cos, sin
 
 
@@ -89,7 +87,6 @@ def compute_rope(x, cos, sin):
 
 class SharedBuffers:
     _buffers = {}
-
     @staticmethod
     def get_buffers(context_length, head_dim, rope_base, freq_config, dtype=torch.float32):
         key = (context_length, head_dim, rope_base, tuple(freq_config.values()) if freq_config else freq_config, dtype)
@@ -206,7 +203,7 @@ class TransformerBlock(nn.Module):
             rope_config=cfg["rope_freq"],
             dtype=cfg["dtype"]
         )
-        self.ff = FeedForward(cfg)
+        self.ff = MLP(cfg)
         self.norm1 = nn.RMSNorm(cfg["emb_dim"], eps=1e-5)
         self.norm2 = nn.RMSNorm(cfg["emb_dim"], eps=1e-5)
 
@@ -253,7 +250,7 @@ LLAMA32_CONFIG = {
     "emb_dim": 2048,            # Embedding dimension
     "n_heads": 32,              # Number of attention heads
     "n_layers": 16,             # Number of layers
-    "hidden_dim": 8192,         # Size of the intermediate dimension in FeedForward
+    "hidden_dim": 8192,         # Size of the intermediate dimension in MLP
     "n_kv_groups": 8,           # Key-Value groups for grouped-query attention
     "rope_base": 500_000.0,     # The base in RoPE's "theta"
     "dtype": torch.bfloat16,    # Lower-precision dtype to reduce memory usage
@@ -275,7 +272,7 @@ LLAMA32_CONFIG = {
 #     "emb_dim": 3072,            # Embedding dimension
 #     "n_heads": 24,              # Number of attention heads
 #     "n_layers": 28,             # Number of layers
-#     "hidden_dim": 8192,         # Size of the intermediate dimension in FeedForward
+#     "hidden_dim": 8192,         # Size of the intermediate dimension in MLP
 #     "n_kv_groups": 8,           # Key-Value groups for grouped-query attention
 #     "rope_base": 500_000.0,     # The base in RoPE's "theta"
 #     "dtype": torch.bfloat16,    # Lower-precision dtype to reduce memory usage
@@ -289,7 +286,9 @@ LLAMA32_CONFIG = {
 
 
 LLAMA_SIZE_STR = "1B" if LLAMA32_CONFIG["emb_dim"] == 2048 else "3B"
+model_id = f"meta-llama/Llama-3.2-{LLAMA_SIZE_STR}-Instruct"
 
+tokenizer = AutoTokenizer.from_pretrained(model_id)
 
 old_context_length = LLAMA32_CONFIG["context_length"]
 LLAMA32_CONFIG["context_length"] = 8192
@@ -306,52 +305,9 @@ LLAMA32_CONFIG["rope_base"] = rescale_theta(
     LLAMA32_CONFIG["context_length"]
 )
 
-print("New RoPE theta:", LLAMA32_CONFIG["rope_base"])
+
 
 model = Llama3Model(LLAMA32_CONFIG)
-
-
-
-print(model.trf_blocks[0].att.mask is model.trf_blocks[-1].att.mask)
-print(model.trf_blocks[0].att.cos is model.trf_blocks[-1].att.cos)
-print(model.trf_blocks[0].att.sin is model.trf_blocks[-1].att.sin)
-
-
-total_params = sum(p.numel() for p in model.parameters())
-print(f"Total number of parameters: {total_params:,}")
-
-# Account for weight tying
-total_params_normalized = total_params - model.tok_emb.weight.numel()
-print(f"\nTotal number of unique parameters: {total_params_normalized:,}")
-
-
-
-def model_memory_size(model, input_dtype=torch.float32):
-    total_params = 0
-    total_grads = 0
-    for param in model.parameters():
-        # Calculate total number of elements per parameter
-        param_size = param.numel()
-        total_params += param_size
-        # Check if gradients are stored for this parameter
-        if param.requires_grad:
-            total_grads += param_size
-
-    # Calculate buffer size (non-parameters that require memory)
-    total_buffers = sum(buf.numel() for buf in model.buffers())
-
-    # Size in bytes = (Number of elements) * (Size of each element in bytes)
-    # We assume parameters and gradients are stored in the same type as input dtype
-    element_size = torch.tensor(0, dtype=input_dtype).element_size()
-    total_memory_bytes = (total_params + total_grads + total_buffers) * element_size
-
-    # Convert bytes to gigabytes
-    total_memory_gb = total_memory_bytes / (1024**3)
-
-    return total_memory_gb
-
-print(f"float32 (PyTorch default): {model_memory_size(model, input_dtype=torch.float32):.2f} GB")
-print(f"bfloat16: {model_memory_size(model, input_dtype=torch.bfloat16):.2f} GB")
 
 
 if torch.cuda.is_available():
@@ -362,87 +318,6 @@ else:
     device = torch.device("cpu")
 
 model.to(device);
-
-
-class Tokenizer:
-    def __init__(self, model_path):
-        assert os.path.isfile(model_path), f"Model file {model_path} not found"
-        mergeable_ranks = load_tiktoken_bpe(model_path)
-
-        self.special_tokens = {
-            "<|begin_of_text|>": 128000,
-            "<|end_of_text|>": 128001,
-            "<|start_header_id|>": 128006,
-            "<|end_header_id|>": 128007,
-            "<|eot_id|>": 128009,
-        }
-        self.special_tokens.update({
-            f"<|reserved_{i}|>": 128002 + i for i in range(256) if (128002 + i) not in self.special_tokens.values()
-        })
-
-        self.model = tiktoken.Encoding(
-            name=Path(model_path).name,
-            pat_str=r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
-            mergeable_ranks=mergeable_ranks,
-            special_tokens=self.special_tokens
-        )
-
-
-    def encode(self, text, bos=False, eos=False, allowed_special=set(), disallowed_special=()):
-
-        if bos:
-            tokens = [self.special_tokens["<|begin_of_text|>"]]
-        else:
-            tokens = []
-
-        tokens += self.model.encode(text, allowed_special=allowed_special, disallowed_special=disallowed_special)
-
-        if eos:
-            tokens.append(self.special_tokens["<|end_of_text|>"])
-        return tokens
-
-    def decode(self, tokens):
-        return self.model.decode(tokens)
-
-
-class ChatFormat:
-    def __init__(self, tokenizer):
-        self.tokenizer = tokenizer
-
-    def encode_header(self, message):
-        tokens = []
-        tokens.append(self.tokenizer.special_tokens["<|start_header_id|>"])
-        tokens.extend(self.tokenizer.encode(message["role"], bos=False, eos=False))
-        tokens.append(self.tokenizer.special_tokens["<|end_header_id|>"])
-        tokens.extend(self.tokenizer.encode("\n\n", bos=False, eos=False))
-        return tokens
-
-    def encode(self, text):
-        message = {
-            "role": "user",
-            "content": text
-        }
-
-        tokens = self.encode_header(message)
-        tokens.extend(
-            self.tokenizer.encode(message["content"].strip(), bos=False, eos=False)
-        )
-        tokens.append(self.tokenizer.special_tokens["<|eot_id|>"])
-        return tokens
-
-    def decode(self, token_ids):
-        return self.tokenizer.decode(token_ids)
-    
-
-
-tokenizer_file_path = hf_hub_download(
-    repo_id=f"meta-llama/Llama-3.2-{LLAMA_SIZE_STR}-Instruct",
-    filename="original/tokenizer.model",
-    local_dir=f"Llama-3.2-{LLAMA_SIZE_STR}-Instruct"
-)
-
-tokenizer = Tokenizer(tokenizer_file_path)
-chat_tokenizer = ChatFormat(tokenizer)
 
 
 def assign(left, right, tensor_name="unknown"):
@@ -487,7 +362,7 @@ def load_weights_into_llama(model, param_config, params):
             f"model.layers.{l}.input_layernorm.weight"
         )
 
-        # Load FeedForward weights
+        # Load MLP weights
         model.trf_blocks[l].ff.fc1.weight = assign(
             model.trf_blocks[l].ff.fc1.weight,
             params[f"model.layers.{l}.mlp.gate_proj.weight"],
@@ -519,15 +394,10 @@ def load_weights_into_llama(model, param_config, params):
         print("Model uses weight tying.")
 
 
-
-
-
-
 if LLAMA_SIZE_STR == "1B":
     weights_file = hf_hub_download(
-        repo_id=f"meta-llama/Llama-3.2-{LLAMA_SIZE_STR}-Instruct",
+        repo_id=model_id,
         filename=f"model.safetensors",
-        local_dir=f"Llama-3.2-{LLAMA_SIZE_STR}-Instruct"
     )
     combined_weights = load_file(weights_file)
 
@@ -536,9 +406,8 @@ else:
     combined_weights = {}
     for i in range(1, 3):
         weights_file = hf_hub_download(
-            repo_id=f"meta-llama/Llama-3.2-{LLAMA_SIZE_STR}-Instruct",
+            repo_id=model_id,
             filename=f"model-0000{i}-of-00002.safetensors",
-            local_dir=f"Llama-3.2-{LLAMA_SIZE_STR}-Instruct"
         )
         current_weights = load_file(weights_file)
         combined_weights.update(current_weights)
@@ -546,22 +415,7 @@ else:
 
 load_weights_into_llama(model, LLAMA32_CONFIG, combined_weights)
 model.to(device)
-del combined_weights  # free up memory
-
-
-print("Weight tying:", torch.equal(model.tok_emb.weight, model.out_head.weight))
-
-
-def text_to_token_ids(text, tokenizer):
-
-    encoded = tokenizer.encode(text)
-    encoded_tensor = torch.tensor(encoded).unsqueeze(0)  # add batch dimension
-    return encoded_tensor
-
-
-def token_ids_to_text(token_ids, tokenizer):
-    flat = token_ids.squeeze(0)  # remove batch dimension
-    return tokenizer.decode(flat.tolist())
+del combined_weights 
 
 
 def generate(model, idx, max_new_tokens, context_size, temperature=0.0, top_k=None, eos_id=None):
@@ -573,7 +427,6 @@ def generate(model, idx, max_new_tokens, context_size, temperature=0.0, top_k=No
         
         with torch.no_grad():
             logits = model(idx_cond)
-            ipdb.set_trace()
         logits = logits[:, -1, :]
 
         # New: Filter logits with top_k sampling
@@ -608,32 +461,25 @@ def generate(model, idx, max_new_tokens, context_size, temperature=0.0, top_k=No
 
 
 
-PROMPT = "What do llamas eat?"
 
-torch.manual_seed(123)
+if __name__ == '__main__':
 
-token_ids = generate(
-    model=model,
-    idx=text_to_token_ids(PROMPT, chat_tokenizer).to(device),
-    max_new_tokens=150,
-    context_size=LLAMA32_CONFIG["context_length"],
-    top_k=1,
-    temperature=0.
-)
+    PROMPT = "What do llamas eat?"
+    idx    = tokenizer.encode(PROMPT, return_tensors="pt").to(device)
+
+    token_ids = generate(
+        model=model,
+        idx=idx,
+        max_new_tokens=100,
+        context_size=LLAMA32_CONFIG["context_length"],
+        top_k=1,
+        temperature=0.
+    )
 
 
-output_text = token_ids_to_text(token_ids, tokenizer)
+
+    output_text = tokenizer.decode(token_ids[0][idx.shape[1]:], skip_special_tokens=True)
+    print("--result")
+    print(output_text)
 
 
-def clean_text(text, header_end="assistant<|end_header_id|>\n\n"):
-    # Find the index of the first occurrence of "<|end_header_id|>"
-    index = text.find(header_end)
-
-    if index != -1:
-        # Return the substring starting after "<|end_header_id|>"
-        return text[index + len(header_end):].strip()  # Strip removes leading/trailing whitespace
-    else:
-        # If the token is not found, return the original text
-        return text
-
-print("Output text:\n", clean_text(output_text))
