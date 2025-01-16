@@ -244,7 +244,10 @@ class Llama3Model(nn.Module):
         return logits
     
 
-LLAMA32_CONFIG = {
+
+
+LLAMA_CONFIG_DICT = {
+    'meta-llama/Llama-3.2-1B-Instruct':{
     "vocab_size": 128_256,      # Vocabulary size
     "context_length": 131_072,  # Context length
     "emb_dim": 2048,            # Embedding dimension
@@ -261,63 +264,43 @@ LLAMA32_CONFIG = {
         "original_context_length": 8192,
     }
 }
+,
+    'meta-llama/Llama-3.2-3B-Instruct':{
+    "vocab_size": 128_256,      # Vocabulary size
+    "context_length": 131_072,  # Context length
+    "emb_dim": 3072,            # Embedding dimension
+    "n_heads": 24,              # Number of attention heads
+    "n_layers": 28,             # Number of layers
+    "hidden_dim": 8192,         # Size of the intermediate dimension in MLP
+    "n_kv_groups": 8,           # Key-Value groups for grouped-query attention
+    "rope_base": 500_000.0,     # The base in RoPE's "theta"
+    "dtype": torch.bfloat16,    # Lower-precision dtype to reduce memory usage
+    "rope_freq": {              # RoPE frequency scaling
+        "factor": 32.0,
+        "low_freq_factor": 1.0,
+        "high_freq_factor": 4.0,
+        "original_context_length": 8192,
+    }
+}
+}
 
 
 
-# Llama 3.2 3B
 
-# LLAMA32_CONFIG = {
-#     "vocab_size": 128_256,      # Vocabulary size
-#     "context_length": 131_072,  # Context length
-#     "emb_dim": 3072,            # Embedding dimension
-#     "n_heads": 24,              # Number of attention heads
-#     "n_layers": 28,             # Number of layers
-#     "hidden_dim": 8192,         # Size of the intermediate dimension in MLP
-#     "n_kv_groups": 8,           # Key-Value groups for grouped-query attention
-#     "rope_base": 500_000.0,     # The base in RoPE's "theta"
-#     "dtype": torch.bfloat16,    # Lower-precision dtype to reduce memory usage
-#     "rope_freq": {              # RoPE frequency scaling
-#         "factor": 32.0,
-#         "low_freq_factor": 1.0,
-#         "high_freq_factor": 4.0,
-#         "original_context_length": 8192,
-#     }
-# }
-
-
-LLAMA_SIZE_STR = "1B" if LLAMA32_CONFIG["emb_dim"] == 2048 else "3B"
-model_id = f"meta-llama/Llama-3.2-{LLAMA_SIZE_STR}-Instruct"
-
-tokenizer = AutoTokenizer.from_pretrained(model_id)
-
-old_context_length = LLAMA32_CONFIG["context_length"]
-LLAMA32_CONFIG["context_length"] = 8192
-
-
-def rescale_theta(theta_old, context_length_old, context_length_new):
+def rescale_theta_(theta_old, context_length_old, context_length_new):
     scaling_factor = context_length_new / context_length_old
     theta_new = theta_old * scaling_factor
     return theta_new
 
-LLAMA32_CONFIG["rope_base"] = rescale_theta(
-    LLAMA32_CONFIG["rope_base"],
-    old_context_length,
-    LLAMA32_CONFIG["context_length"]
-)
-
-
-
-model = Llama3Model(LLAMA32_CONFIG)
-
-
-if torch.cuda.is_available():
-    device = torch.device("cuda")
-elif torch.backends.mps.is_available():
-    device = torch.device("mps")
-else:
-    device = torch.device("cpu")
-
-model.to(device);
+def rescale_theta(LLAMA_CONFIG):
+    old_context_length = LLAMA_CONFIG["context_length"]
+    LLAMA_CONFIG["context_length"] = 8192
+    LLAMA_CONFIG["rope_base"] = rescale_theta_(
+        LLAMA_CONFIG["rope_base"],
+        old_context_length,
+        LLAMA_CONFIG["context_length"]
+    )
+    return LLAMA_CONFIG
 
 
 def assign(left, right, tensor_name="unknown"):
@@ -330,7 +313,7 @@ def assign(left, right, tensor_name="unknown"):
         return torch.nn.Parameter(torch.tensor(right))
 
 
-def load_weights_into_llama(model, param_config, params):
+def load_weights_into_llama_(model, param_config, params):
     model.tok_emb.weight = assign(model.tok_emb.weight, params["model.embed_tokens.weight"], "model.embed_tokens.weight")
 
     for l in range(param_config["n_layers"]):
@@ -394,28 +377,33 @@ def load_weights_into_llama(model, param_config, params):
         print("Model uses weight tying.")
 
 
-if LLAMA_SIZE_STR == "1B":
-    weights_file = hf_hub_download(
-        repo_id=model_id,
-        filename=f"model.safetensors",
-    )
-    combined_weights = load_file(weights_file)
 
-
-else:
-    combined_weights = {}
-    for i in range(1, 3):
+def load_weights_into_llama(model_id, model,LLAMA_CONFIG):
+    model.to(device)
+    if model_id == "meta-llama/Llama-3.2-1B-Instruct":
         weights_file = hf_hub_download(
             repo_id=model_id,
-            filename=f"model-0000{i}-of-00002.safetensors",
+            filename=f"model.safetensors",
         )
-        current_weights = load_file(weights_file)
-        combined_weights.update(current_weights)
+        combined_weights = load_file(weights_file)
+    elif model_id == "meta-llama/Llama-3.2-3B-Instruct":
+        combined_weights = {}
+        for i in range(1, 3):
+            weights_file = hf_hub_download(
+                repo_id=model_id,
+                filename=f"model-0000{i}-of-00002.safetensors",
+            )
+            current_weights = load_file(weights_file)
+            combined_weights.update(current_weights)
 
 
-load_weights_into_llama(model, LLAMA32_CONFIG, combined_weights)
-model.to(device)
-del combined_weights 
+    load_weights_into_llama_(model, LLAMA_CONFIG, combined_weights)
+    model.to(device)
+    del combined_weights 
+    return model
+
+
+
 
 
 def generate(model, idx, max_new_tokens, context_size, temperature=0.0, top_k=None, eos_id=None):
@@ -464,6 +452,24 @@ def generate(model, idx, max_new_tokens, context_size, temperature=0.0, top_k=No
 
 if __name__ == '__main__':
 
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+
+
+    model_id = "meta-llama/Llama-3.2-1B-Instruct"
+    # model_id = "meta-llama/Llama-3.2-3B-Instruct"
+    # model_id = "meta-llama/Meta-Llama-3.1-8B-Instruct"    
+
+    LLAMA_CONFIG = LLAMA_CONFIG_DICT[model_id]
+    LLAMA_CONFIG = rescale_theta(LLAMA_CONFIG)
+
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    model = Llama3Model(LLAMA_CONFIG)
+    model = load_weights_into_llama(model_id, model,LLAMA_CONFIG)
+
+
     messages = [
     {"role": "system", "content": "You are a pirate chatbot who always responds in pirate speak!"},
     {"role": "user", "content": "Who are you?"},]
@@ -474,13 +480,10 @@ if __name__ == '__main__':
         model=model,
         idx=input_ids,
         max_new_tokens=100,
-        context_size=LLAMA32_CONFIG["context_length"],
-        top_k=2,
+        context_size=LLAMA_CONFIG["context_length"],
+        top_k=1,
         temperature=0.
     )
-
-
-
     output_text = tokenizer.decode(output_ids[0][input_ids.shape[1]:], skip_special_tokens=True)
     print("--result")
     print(output_text)
