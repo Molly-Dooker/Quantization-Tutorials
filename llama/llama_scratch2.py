@@ -141,49 +141,33 @@ class GroupedQueryAttention(nn.Module):
         keys = self.W_key(x)  # Shape: (b, num_tokens, num_kv_groups * head_dim)
         values = self.W_value(x)  # Shape: (b, num_tokens, num_kv_groups * head_dim)
 
-        # Reshape queries, keys, and values
+
         queries = queries.view(b, num_tokens, self.num_heads, self.head_dim)
         keys = keys.view(b, num_tokens, self.num_kv_groups, self.head_dim)
         values = values.view(b, num_tokens, self.num_kv_groups, self.head_dim)
 
-        # Transpose keys, values, and queries
+
         keys = keys.transpose(1, 2)  # Shape: (b, num_heads, num_tokens, head_dim)
         values = values.transpose(1, 2)  # Shape: (b, num_heads, num_tokens, head_dim)
         queries = queries.transpose(1, 2)  # Shape: (b, num_query_groups, num_tokens, head_dim)
 
-        # Apply RoPE
+
         keys = compute_rope(keys, self.cos, self.sin)
         queries = compute_rope(queries, self.cos, self.sin)
 
-        # Expand keys and values to match the number of heads
-        # Shape: (b, num_heads, num_tokens, head_dim)
         keys = keys.repeat_interleave(self.group_size, dim=1)  # Shape: (b, num_heads, num_tokens, head_dim)
         values = values.repeat_interleave(self.group_size, dim=1)  # Shape: (b, num_heads, num_tokens, head_dim)
-        # For example, before repeat_interleave along dim=1 (query groups):
-        #   [K1, K2]
-        # After repeat_interleave (each query group is repeated group_size times):
-        #   [K1, K1, K2, K2]
-        # If we used regular repeat instead of repeat_interleave, we'd get:
-        #   [K1, K2, K1, K2]
-
-        # Compute scaled dot-product attention (aka self-attention) with a causal mask
-        # Shape: (b, num_heads, num_tokens, num_tokens)
-
         attn_scores = queries @ keys.transpose(2, 3)  # Dot product for each head
 
-        # Original mask truncated to the number of tokens and converted to boolean
         mask_bool = self.mask.bool()[:num_tokens, :num_tokens]
 
-        # Use the mask to fill attention scores
         attn_scores.masked_fill_(mask_bool, -torch.inf)
 
         attn_weights = torch.softmax(attn_scores / keys.shape[-1]**0.5, dim=-1)
         assert keys.shape[-1] == self.head_dim
 
-        # Shape: (b, num_tokens, num_heads, head_dim)
         context_vec = (attn_weights @ values).transpose(1, 2)
 
-        # Combine heads, where self.d_out = self.num_heads * self.head_dim
         context_vec = context_vec.reshape(b, num_tokens, self.d_out)
         context_vec = self.out_proj(context_vec)  # optional projection
 
@@ -209,17 +193,16 @@ class TransformerBlock(nn.Module):
 
     def forward(self, x):
 
-        # Shortcut connection for attention block
+
         shortcut = x
         x = self.norm1(x)
-        x = self.att(x.to(torch.bfloat16))   # Shape [batch_size, num_tokens, emb_size]
-        x = x + shortcut  # Add the original input back
+        x = self.att(x.to(torch.bfloat16))   
+        x = x + shortcut  
 
-        # Shortcut connection for feed-forward block
         shortcut = x
         x = self.norm2(x)
         x = self.ff(x.to(torch.bfloat16))
-        x = x + shortcut  # Add the original input back
+        x = x + shortcut  
 
         return x
     
@@ -367,7 +350,7 @@ def load_weights_into_llama_(model, param_config, params):
             f"model.layers.{l}.post_attention_layernorm.weight"
         )
 
-    # Load output layer weights
+
     model.final_norm.weight = assign(model.final_norm.weight, params["model.norm.weight"], "model.norm.weight")
 
     if "lm_head.weight" in params.keys():
@@ -408,8 +391,6 @@ def load_weights_into_llama(model_id, model,LLAMA_CONFIG):
 
 def generate(model, idx, max_new_tokens, context_size, temperature=0.0, top_k=None, eos_id=None):
 
-    # For-loop is the same as before: Get logits, and only focus on last time step
-
     for _ in range(max_new_tokens):
         idx_cond = idx[:, -context_size:]
         
@@ -417,24 +398,24 @@ def generate(model, idx, max_new_tokens, context_size, temperature=0.0, top_k=No
             logits = model(idx_cond)
         logits = logits[:, -1, :]
 
-        # New: Filter logits with top_k sampling
+
         if top_k is not None:
             # Keep only top_k values
             top_logits, _ = torch.topk(logits, top_k)
             min_val = top_logits[:, -1]
             logits = torch.where(logits < min_val, torch.tensor(float('-inf')).to(logits.device), logits)
 
-        # New: Apply temperature scaling
+
         if temperature > 0.0:
             logits = logits / temperature
 
-            # Apply softmax to get probabilities
+
             probs = torch.softmax(logits, dim=-1)  # (batch_size, context_len)
 
-            # Sample from the distribution
+
             idx_next = torch.multinomial(probs, num_samples=1)  # (batch_size, 1)
 
-        # Otherwise same as before: get idx of the vocab entry with the highest logits value
+
         else:
             idx_next = torch.argmax(logits, dim=-1, keepdim=True)  # (batch_size, 1)
 
@@ -442,7 +423,7 @@ def generate(model, idx, max_new_tokens, context_size, temperature=0.0, top_k=No
 
             break
 
-        # Same as before: append sampled index to the running sequence
+
         idx = torch.cat((idx, idx_next), dim=1)  # (batch_size, num_tokens+1)
     return idx
 
