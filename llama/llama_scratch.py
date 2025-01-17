@@ -1,4 +1,4 @@
-import ipdb
+import argparse
 import torch
 import torch.nn as nn
 from safetensors.torch import load_file
@@ -416,6 +416,9 @@ def generate(model, idx, max_new_tokens, context_size, temperature=0.0, top_k=No
     return idx
 
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--model", type=str, help="choose model meta-llama/Llama-3.2-1B-Instruct, meta-llama/Llama-3.2-3B-Instruct, meta-llama/Meta-Llama-3.1-8B-Instruct")
+
 
 if __name__ == '__main__':
 
@@ -424,12 +427,11 @@ if __name__ == '__main__':
     else:
         device = torch.device("cpu")
 
-    # choose model
+    args = parser.parse_args()
+    model_id = args.model
+    print('-- selected model: {model_id}')
     ## it takes more then 20sec for building 3B model and load weight.  please take a time.
     ## 8B model is not tested (oom)
-    model_id = "meta-llama/Llama-3.2-1B-Instruct"
-    # model_id = "meta-llama/Llama-3.2-3B-Instruct"
-    # model_id = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 
     LLAMA_CONFIG = LLAMA_CONFIG_DICT[model_id]
     tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -454,7 +456,7 @@ if __name__ == '__main__':
         temperature=0.
     )
     output_text = tokenizer.decode(output_ids[0][input_ids.shape[1]:], skip_special_tokens=True)
-    print("--result")
+    print("-- result")
     print(output_text)
 
 
