@@ -157,7 +157,6 @@ class GroupedQueryAttention(nn.Module):
 
         context_vec = context_vec.reshape(b, num_tokens, self.d_out)
         context_vec = self.out_proj(context_vec)  # optional projection
-        print(context_vec.shape)
         return context_vec
     
 
@@ -218,16 +217,16 @@ class Llama3Model(nn.Module):
 
 LLAMA_CONFIG_DICT = {
     'meta-llama/Llama-3.2-1B-Instruct':{
-    "vocab_size": 128_256,      # Vocabulary size
-    "context_length": 131_072,  # Context length
-    "emb_dim": 2048,            # Embedding dimension
-    "n_heads": 32,              # Number of attention heads
-    "n_layers": 16,             # Number of layers
-    "hidden_dim": 8192,         # Size of the intermediate dimension in MLP
-    "n_kv_groups": 8,           # Key-Value groups for grouped-query attention
-    "rope_base": 500_000.0,     # The base in RoPE's "theta"
-    "dtype": torch.bfloat16,    # Lower-precision dtype to reduce memory usage
-    "rope_freq": {              # RoPE frequency scaling
+    "vocab_size": 128_256,
+    "context_length": 8192,
+    "emb_dim": 2048,          
+    "n_heads": 32,         
+    "n_layers": 16,            
+    "hidden_dim": 8192,      
+    "n_kv_groups": 8,           
+    "rope_base": 31250.0,    
+    "dtype": torch.bfloat16,   
+    "rope_freq": {              
         "factor": 32.0,
         "low_freq_factor": 1.0,
         "high_freq_factor": 4.0,
@@ -236,17 +235,35 @@ LLAMA_CONFIG_DICT = {
 }
 ,
     'meta-llama/Llama-3.2-3B-Instruct':{
-    "vocab_size": 128_256,      # Vocabulary size
-    "context_length": 131_072,  # Context length
-    "emb_dim": 3072,            # Embedding dimension
-    "n_heads": 24,              # Number of attention heads
-    "n_layers": 28,             # Number of layers
-    "hidden_dim": 8192,         # Size of the intermediate dimension in MLP
-    "n_kv_groups": 8,           # Key-Value groups for grouped-query attention
-    "rope_base": 500_000.0,     # The base in RoPE's "theta"
-    "dtype": torch.bfloat16,    # Lower-precision dtype to reduce memory usage
-    "rope_freq": {              # RoPE frequency scaling
+    "vocab_size": 128_256,      
+    "context_length": 8192, 
+    "emb_dim": 3072,           
+    "n_heads": 24,             
+    "n_layers": 28,          
+    "hidden_dim": 8192,        
+    "n_kv_groups": 8,           
+    "rope_base": 31250.0,     
+    "dtype": torch.bfloat16,   
+    "rope_freq": {              
         "factor": 32.0,
+        "low_freq_factor": 1.0,
+        "high_freq_factor": 4.0,
+        "original_context_length": 8192,
+    }
+}
+,
+    'meta-llama/Meta-Llama-3.1-8B-Instruct':{
+    "vocab_size": 128_256,      
+    "context_length": 131_072,  
+    "emb_dim": 4096,           
+    "n_heads": 32,             
+    "n_layers": 32,            
+    "hidden_dim": 14336,       
+    "n_kv_groups": 8,           
+    "rope_base": 500_000.0,     
+    "dtype": torch.bfloat16,    
+    "rope_freq": {              
+        "factor": 8.0,
         "low_freq_factor": 1.0,
         "high_freq_factor": 4.0,
         "original_context_length": 8192,
@@ -254,23 +271,6 @@ LLAMA_CONFIG_DICT = {
 }
 }
 
-
-
-
-def rescale_theta_(theta_old, context_length_old, context_length_new):
-    scaling_factor = context_length_new / context_length_old
-    theta_new = theta_old * scaling_factor
-    return theta_new
-
-def rescale_theta(LLAMA_CONFIG):
-    old_context_length = LLAMA_CONFIG["context_length"]
-    LLAMA_CONFIG["context_length"] = 8192
-    LLAMA_CONFIG["rope_base"] = rescale_theta_(
-        LLAMA_CONFIG["rope_base"],
-        old_context_length,
-        LLAMA_CONFIG["context_length"]
-    )
-    return LLAMA_CONFIG
 
 
 def assign(left, right, tensor_name="unknown"):
@@ -288,7 +288,6 @@ def load_weights_into_llama_(model, param_config, params):
 
     for l in range(param_config["n_layers"]):
 
-        # Load attention weights
         model.trf_blocks[l].att.W_query.weight = assign(
             model.trf_blocks[l].att.W_query.weight,
             params[f"model.layers.{l}.self_attn.q_proj.weight"],
@@ -344,7 +343,7 @@ def load_weights_into_llama_(model, param_config, params):
         model.out_head.weight = assign(model.out_head.weight, params["lm_head.weight"], "lm_head.weight")
     else:
         model.out_head.weight = assign(model.out_head.weight, params["model.embed_tokens.weight"], "model.embed_tokens.weight")
-        print("Model uses weight tying.")
+
 
 
 
@@ -366,14 +365,20 @@ def load_weights_into_llama(model_id, model,LLAMA_CONFIG):
             current_weights = load_file(weights_file)
             combined_weights.update(current_weights)
 
+    elif model_id == "meta-llama/Meta-Llama-3.1-8B-Instruct":
+        combined_weights = {}
+        for i in range(1, 5):
+            weights_file = hf_hub_download(
+                repo_id=model_id,
+                filename=f"model-0000{i}-of-00004.safetensors",
+            )
+            current_weights = load_file(weights_file)
+            combined_weights.update(current_weights)
 
     load_weights_into_llama_(model, LLAMA_CONFIG, combined_weights)
     model.to(device)
     del combined_weights 
     return model
-
-
-
 
 
 def generate(model, idx, max_new_tokens, context_size, temperature=0.0, top_k=None, eos_id=None):
@@ -406,14 +411,9 @@ def generate(model, idx, max_new_tokens, context_size, temperature=0.0, top_k=No
             idx_next = torch.argmax(logits, dim=-1, keepdim=True)  # (batch_size, 1)
 
         if idx_next == eos_id:  # Stop generating early if end-of-sequence token is encountered and eos_id is specified
-
             break
-
-
         idx = torch.cat((idx, idx_next), dim=1)  # (batch_size, num_tokens+1)
     return idx
-
-
 
 
 
@@ -424,16 +424,17 @@ if __name__ == '__main__':
     else:
         device = torch.device("cpu")
 
-
+    # choose model
+    ## it takes more then 20sec for building 3B model and load weight.  please take a time.
+    ## 8B model is not tested (oom)
     model_id = "meta-llama/Llama-3.2-1B-Instruct"
     # model_id = "meta-llama/Llama-3.2-3B-Instruct"
-    # model_id = "meta-llama/Meta-Llama-3.1-8B-Instruct"    
+    # model_id = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 
     LLAMA_CONFIG = LLAMA_CONFIG_DICT[model_id]
-    LLAMA_CONFIG = rescale_theta(LLAMA_CONFIG)
-
     tokenizer = AutoTokenizer.from_pretrained(model_id)
-    # ipdb.set_trace()
+    
+
     model = Llama3Model(LLAMA_CONFIG)
     model = load_weights_into_llama(model_id, model,LLAMA_CONFIG)
 
