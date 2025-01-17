@@ -1,10 +1,6 @@
 import ipdb
 import torch
 import torch.nn as nn
-import os
-from pathlib import Path
-import tiktoken
-from tiktoken.load import load_tiktoken_bpe
 from safetensors.torch import load_file
 from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer
@@ -51,35 +47,27 @@ def precompute_rope_params(head_dim, theta_base=10_000, context_length=4096, fre
         inv_freq_llama = torch.where(is_medium_freq, smoothed_inv_freq, inv_freq_llama)
         inv_freq = inv_freq_llama
 
-    # Generate position indices
     positions = torch.arange(context_length)
 
-    # Compute the angles
     angles = positions[:, None] * inv_freq[None, :]  # Shape: (context_length, head_dim // 2)
-
-    # Expand angles to match the head_dim
     angles = torch.cat([angles, angles], dim=1)  # Shape: (context_length, head_dim)
 
-    # Precompute sine and cosine
     cos = torch.cos(angles)
     sin = torch.sin(angles)
     return cos, sin
 
 
 def compute_rope(x, cos, sin):
-    # x: (batch_size, num_heads, seq_len, head_dim)
+
     batch_size, num_heads, seq_len, head_dim = x.shape
     assert head_dim % 2 == 0, "Head dimension must be even"
 
-    # Split x into first half and second half
     x1 = x[..., : head_dim // 2]  # First half
     x2 = x[..., head_dim // 2 :]  # Second half
 
-    # Adjust sin and cos shapes
     cos = cos[:seq_len, :].unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, seq_len, head_dim)
     sin = sin[:seq_len, :].unsqueeze(0).unsqueeze(0)
 
-    # Apply the rotary transformation
     rotated = torch.cat((-x2, x1), dim=-1)
     x_rotated = (x * cos) + (rotated * sin)
 
@@ -127,7 +115,6 @@ class GroupedQueryAttention(nn.Module):
         self.W_query = nn.Linear(d_in, d_out, bias=False, dtype=dtype)
         self.out_proj = nn.Linear(d_out, d_out, bias=False, dtype=dtype)
 
-        # Fetch buffers using SharedBuffers
         mask, cos, sin = SharedBuffers.get_buffers(context_length, self.head_dim, rope_base, rope_config, dtype)
         self.register_buffer("mask", mask)
 
@@ -141,52 +128,36 @@ class GroupedQueryAttention(nn.Module):
         keys = self.W_key(x)  # Shape: (b, num_tokens, num_kv_groups * head_dim)
         values = self.W_value(x)  # Shape: (b, num_tokens, num_kv_groups * head_dim)
 
-        # Reshape queries, keys, and values
+
         queries = queries.view(b, num_tokens, self.num_heads, self.head_dim)
         keys = keys.view(b, num_tokens, self.num_kv_groups, self.head_dim)
         values = values.view(b, num_tokens, self.num_kv_groups, self.head_dim)
 
-        # Transpose keys, values, and queries
+
         keys = keys.transpose(1, 2)  # Shape: (b, num_heads, num_tokens, head_dim)
         values = values.transpose(1, 2)  # Shape: (b, num_heads, num_tokens, head_dim)
         queries = queries.transpose(1, 2)  # Shape: (b, num_query_groups, num_tokens, head_dim)
 
-        # Apply RoPE
+
         keys = compute_rope(keys, self.cos, self.sin)
         queries = compute_rope(queries, self.cos, self.sin)
 
-        # Expand keys and values to match the number of heads
-        # Shape: (b, num_heads, num_tokens, head_dim)
         keys = keys.repeat_interleave(self.group_size, dim=1)  # Shape: (b, num_heads, num_tokens, head_dim)
         values = values.repeat_interleave(self.group_size, dim=1)  # Shape: (b, num_heads, num_tokens, head_dim)
-        # For example, before repeat_interleave along dim=1 (query groups):
-        #   [K1, K2]
-        # After repeat_interleave (each query group is repeated group_size times):
-        #   [K1, K1, K2, K2]
-        # If we used regular repeat instead of repeat_interleave, we'd get:
-        #   [K1, K2, K1, K2]
-
-        # Compute scaled dot-product attention (aka self-attention) with a causal mask
-        # Shape: (b, num_heads, num_tokens, num_tokens)
-
         attn_scores = queries @ keys.transpose(2, 3)  # Dot product for each head
 
-        # Original mask truncated to the number of tokens and converted to boolean
         mask_bool = self.mask.bool()[:num_tokens, :num_tokens]
 
-        # Use the mask to fill attention scores
         attn_scores.masked_fill_(mask_bool, -torch.inf)
 
         attn_weights = torch.softmax(attn_scores / keys.shape[-1]**0.5, dim=-1)
         assert keys.shape[-1] == self.head_dim
 
-        # Shape: (b, num_tokens, num_heads, head_dim)
         context_vec = (attn_weights @ values).transpose(1, 2)
 
-        # Combine heads, where self.d_out = self.num_heads * self.head_dim
         context_vec = context_vec.reshape(b, num_tokens, self.d_out)
         context_vec = self.out_proj(context_vec)  # optional projection
-
+        print(context_vec.shape)
         return context_vec
     
 
@@ -209,17 +180,16 @@ class TransformerBlock(nn.Module):
 
     def forward(self, x):
 
-        # Shortcut connection for attention block
+
         shortcut = x
         x = self.norm1(x)
-        x = self.att(x.to(torch.bfloat16))   # Shape [batch_size, num_tokens, emb_size]
-        x = x + shortcut  # Add the original input back
+        x = self.att(x.to(torch.bfloat16))   
+        x = x + shortcut  
 
-        # Shortcut connection for feed-forward block
         shortcut = x
         x = self.norm2(x)
         x = self.ff(x.to(torch.bfloat16))
-        x = x + shortcut  # Add the original input back
+        x = x + shortcut  
 
         return x
     
@@ -244,7 +214,10 @@ class Llama3Model(nn.Module):
         return logits
     
 
-LLAMA32_CONFIG = {
+
+
+LLAMA_CONFIG_DICT = {
+    'meta-llama/Llama-3.2-1B-Instruct':{
     "vocab_size": 128_256,      # Vocabulary size
     "context_length": 131_072,  # Context length
     "emb_dim": 2048,            # Embedding dimension
@@ -261,63 +234,43 @@ LLAMA32_CONFIG = {
         "original_context_length": 8192,
     }
 }
+,
+    'meta-llama/Llama-3.2-3B-Instruct':{
+    "vocab_size": 128_256,      # Vocabulary size
+    "context_length": 131_072,  # Context length
+    "emb_dim": 3072,            # Embedding dimension
+    "n_heads": 24,              # Number of attention heads
+    "n_layers": 28,             # Number of layers
+    "hidden_dim": 8192,         # Size of the intermediate dimension in MLP
+    "n_kv_groups": 8,           # Key-Value groups for grouped-query attention
+    "rope_base": 500_000.0,     # The base in RoPE's "theta"
+    "dtype": torch.bfloat16,    # Lower-precision dtype to reduce memory usage
+    "rope_freq": {              # RoPE frequency scaling
+        "factor": 32.0,
+        "low_freq_factor": 1.0,
+        "high_freq_factor": 4.0,
+        "original_context_length": 8192,
+    }
+}
+}
 
 
 
-# Llama 3.2 3B
 
-# LLAMA32_CONFIG = {
-#     "vocab_size": 128_256,      # Vocabulary size
-#     "context_length": 131_072,  # Context length
-#     "emb_dim": 3072,            # Embedding dimension
-#     "n_heads": 24,              # Number of attention heads
-#     "n_layers": 28,             # Number of layers
-#     "hidden_dim": 8192,         # Size of the intermediate dimension in MLP
-#     "n_kv_groups": 8,           # Key-Value groups for grouped-query attention
-#     "rope_base": 500_000.0,     # The base in RoPE's "theta"
-#     "dtype": torch.bfloat16,    # Lower-precision dtype to reduce memory usage
-#     "rope_freq": {              # RoPE frequency scaling
-#         "factor": 32.0,
-#         "low_freq_factor": 1.0,
-#         "high_freq_factor": 4.0,
-#         "original_context_length": 8192,
-#     }
-# }
-
-
-LLAMA_SIZE_STR = "1B" if LLAMA32_CONFIG["emb_dim"] == 2048 else "3B"
-model_id = f"meta-llama/Llama-3.2-{LLAMA_SIZE_STR}-Instruct"
-
-tokenizer = AutoTokenizer.from_pretrained(model_id)
-
-old_context_length = LLAMA32_CONFIG["context_length"]
-LLAMA32_CONFIG["context_length"] = 8192
-
-
-def rescale_theta(theta_old, context_length_old, context_length_new):
+def rescale_theta_(theta_old, context_length_old, context_length_new):
     scaling_factor = context_length_new / context_length_old
     theta_new = theta_old * scaling_factor
     return theta_new
 
-LLAMA32_CONFIG["rope_base"] = rescale_theta(
-    LLAMA32_CONFIG["rope_base"],
-    old_context_length,
-    LLAMA32_CONFIG["context_length"]
-)
-
-
-
-model = Llama3Model(LLAMA32_CONFIG)
-
-
-if torch.cuda.is_available():
-    device = torch.device("cuda")
-elif torch.backends.mps.is_available():
-    device = torch.device("mps")
-else:
-    device = torch.device("cpu")
-
-model.to(device);
+def rescale_theta(LLAMA_CONFIG):
+    old_context_length = LLAMA_CONFIG["context_length"]
+    LLAMA_CONFIG["context_length"] = 8192
+    LLAMA_CONFIG["rope_base"] = rescale_theta_(
+        LLAMA_CONFIG["rope_base"],
+        old_context_length,
+        LLAMA_CONFIG["context_length"]
+    )
+    return LLAMA_CONFIG
 
 
 def assign(left, right, tensor_name="unknown"):
@@ -330,7 +283,7 @@ def assign(left, right, tensor_name="unknown"):
         return torch.nn.Parameter(torch.tensor(right))
 
 
-def load_weights_into_llama(model, param_config, params):
+def load_weights_into_llama_(model, param_config, params):
     model.tok_emb.weight = assign(model.tok_emb.weight, params["model.embed_tokens.weight"], "model.embed_tokens.weight")
 
     for l in range(param_config["n_layers"]):
@@ -384,7 +337,7 @@ def load_weights_into_llama(model, param_config, params):
             f"model.layers.{l}.post_attention_layernorm.weight"
         )
 
-    # Load output layer weights
+
     model.final_norm.weight = assign(model.final_norm.weight, params["model.norm.weight"], "model.norm.weight")
 
     if "lm_head.weight" in params.keys():
@@ -394,59 +347,61 @@ def load_weights_into_llama(model, param_config, params):
         print("Model uses weight tying.")
 
 
-if LLAMA_SIZE_STR == "1B":
-    weights_file = hf_hub_download(
-        repo_id=model_id,
-        filename=f"model.safetensors",
-    )
-    combined_weights = load_file(weights_file)
 
-
-else:
-    combined_weights = {}
-    for i in range(1, 3):
+def load_weights_into_llama(model_id, model,LLAMA_CONFIG):
+    model.to(device)
+    if model_id == "meta-llama/Llama-3.2-1B-Instruct":
         weights_file = hf_hub_download(
             repo_id=model_id,
-            filename=f"model-0000{i}-of-00002.safetensors",
+            filename=f"model.safetensors",
         )
-        current_weights = load_file(weights_file)
-        combined_weights.update(current_weights)
+        combined_weights = load_file(weights_file)
+    elif model_id == "meta-llama/Llama-3.2-3B-Instruct":
+        combined_weights = {}
+        for i in range(1, 3):
+            weights_file = hf_hub_download(
+                repo_id=model_id,
+                filename=f"model-0000{i}-of-00002.safetensors",
+            )
+            current_weights = load_file(weights_file)
+            combined_weights.update(current_weights)
 
 
-load_weights_into_llama(model, LLAMA32_CONFIG, combined_weights)
-model.to(device)
-del combined_weights 
+    load_weights_into_llama_(model, LLAMA_CONFIG, combined_weights)
+    model.to(device)
+    del combined_weights 
+    return model
+
+
+
 
 
 def generate(model, idx, max_new_tokens, context_size, temperature=0.0, top_k=None, eos_id=None):
 
-    # For-loop is the same as before: Get logits, and only focus on last time step
-
     for _ in range(max_new_tokens):
         idx_cond = idx[:, -context_size:]
-        
         with torch.no_grad():
             logits = model(idx_cond)
         logits = logits[:, -1, :]
 
-        # New: Filter logits with top_k sampling
+
         if top_k is not None:
             # Keep only top_k values
             top_logits, _ = torch.topk(logits, top_k)
             min_val = top_logits[:, -1]
             logits = torch.where(logits < min_val, torch.tensor(float('-inf')).to(logits.device), logits)
 
-        # New: Apply temperature scaling
+
         if temperature > 0.0:
             logits = logits / temperature
 
-            # Apply softmax to get probabilities
+
             probs = torch.softmax(logits, dim=-1)  # (batch_size, context_len)
 
-            # Sample from the distribution
+
             idx_next = torch.multinomial(probs, num_samples=1)  # (batch_size, 1)
 
-        # Otherwise same as before: get idx of the vocab entry with the highest logits value
+
         else:
             idx_next = torch.argmax(logits, dim=-1, keepdim=True)  # (batch_size, 1)
 
@@ -454,7 +409,7 @@ def generate(model, idx, max_new_tokens, context_size, temperature=0.0, top_k=No
 
             break
 
-        # Same as before: append sampled index to the running sequence
+
         idx = torch.cat((idx, idx_next), dim=1)  # (batch_size, num_tokens+1)
     return idx
 
@@ -463,6 +418,25 @@ def generate(model, idx, max_new_tokens, context_size, temperature=0.0, top_k=No
 
 
 if __name__ == '__main__':
+
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+
+
+    model_id = "meta-llama/Llama-3.2-1B-Instruct"
+    # model_id = "meta-llama/Llama-3.2-3B-Instruct"
+    # model_id = "meta-llama/Meta-Llama-3.1-8B-Instruct"    
+
+    LLAMA_CONFIG = LLAMA_CONFIG_DICT[model_id]
+    LLAMA_CONFIG = rescale_theta(LLAMA_CONFIG)
+
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    # ipdb.set_trace()
+    model = Llama3Model(LLAMA_CONFIG)
+    model = load_weights_into_llama(model_id, model,LLAMA_CONFIG)
+
 
     messages = [
     {"role": "system", "content": "You are a pirate chatbot who always responds in pirate speak!"},
@@ -474,13 +448,10 @@ if __name__ == '__main__':
         model=model,
         idx=input_ids,
         max_new_tokens=100,
-        context_size=LLAMA32_CONFIG["context_length"],
-        top_k=2,
+        context_size=LLAMA_CONFIG["context_length"],
+        top_k=1,
         temperature=0.
     )
-
-
-
     output_text = tokenizer.decode(output_ids[0][input_ids.shape[1]:], skip_special_tokens=True)
     print("--result")
     print(output_text)
