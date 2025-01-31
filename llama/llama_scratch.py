@@ -5,7 +5,7 @@ from safetensors.torch import load_file
 from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer
 torch.manual_seed(123)
-
+from loguru import logger
 class MLP(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -210,6 +210,7 @@ class Llama3Model(nn.Module):
         x = self.trf_blocks(x)
         x = self.final_norm(x)
         logits = self.out_head(x.to(torch.bfloat16))
+        logger.info(f'input:{x.shape}, output:{logits.shape}')
         return logits
     
 
@@ -429,7 +430,7 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     model_id = args.model
-    print('-- selected model: {model_id}')
+    print(f'-- selected model: {model_id}')
     ## it takes more then 20sec for building 3B model and load weight.  please take a time.
     ## 8B model is not tested (oom)
 
