@@ -10,7 +10,7 @@ model_id = "meta-llama/Llama-3.2-1B-Instruct"
 
 tokenizer = AutoTokenizer.from_pretrained(model_id)
 model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=dtype, device_map=device)
-# ipdb.set_trace()
+
 
 def moderate(messages):
     input_ids = tokenizer.apply_chat_template(messages, return_tensors="pt").to(device)
